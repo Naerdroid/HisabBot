@@ -302,8 +302,6 @@ QWEN_MODEL=qwen2.5-7b-instruct
 
 For security, `.env` is excluded from Git.
 
-A `.env.example` file can be used to document the required configuration without exposing secrets.
-
 ---
 
 # API
