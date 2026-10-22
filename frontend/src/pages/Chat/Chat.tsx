@@ -16,11 +16,64 @@ const WELCOME_MESSAGE: Message = {
   timestamp: new Date(),
 };
 
+// Persist the conversation locally so it survives navigation and refreshes.
+const CHAT_STORAGE_KEY = 'hisabbot.chat.messages.v1';
+const MAX_STORED_MESSAGES = 100;
+
+// Recent turns sent with each new message so the backend model has context —
+// e.g. "5000 ka" can be matched to the pending expense from the previous
+// message. Capped so requests stay small (the backend caps them again).
+const MAX_HISTORY_MESSAGES = 8;
+const MAX_HISTORY_CONTENT = 1000;
+
+function loadStoredMessages(): Message[] {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return [WELCOME_MESSAGE];
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [WELCOME_MESSAGE];
+
+    const restored: Message[] = parsed
+      .filter(
+        (m) =>
+          m &&
+          typeof m.id === 'string' &&
+          (m.role === 'user' || m.role === 'bot') &&
+          typeof m.text === 'string'
+      )
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        text: m.text,
+        timestamp: new Date(typeof m.timestamp === 'string' ? m.timestamp : Date.now()),
+      }))
+      .filter((m) => !Number.isNaN(m.timestamp.getTime()));
+
+    return restored.length > 0 ? restored : [WELCOME_MESSAGE];
+  } catch {
+    // Unreadable/corrupted storage — start a fresh conversation instead of crashing
+    return [WELCOME_MESSAGE];
+  }
+}
+
 export default function Chat() {
-  const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
+  const [messages, setMessages] = useState<Message[]>(loadStoredMessages);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Save the conversation after every change (capped to keep storage small)
+  useEffect(() => {
+    try {
+      const serializable = messages
+        .slice(-MAX_STORED_MESSAGES)
+        .map((m) => ({ ...m, timestamp: m.timestamp.toISOString() }));
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(serializable));
+    } catch {
+      // Storage unavailable or full — the chat still works in memory
+    }
+  }, [messages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -29,6 +82,16 @@ export default function Chat() {
   const handleSend = async () => {
     const text = input.trim();
     if (!text || sending) return;
+
+    // Prior conversation turns (before this new message) give the backend
+    // model the context it needs for follow-up replies like "5000 ka".
+    const history = messages
+      .filter((m) => m.id !== WELCOME_MESSAGE.id)
+      .slice(-MAX_HISTORY_MESSAGES)
+      .map((m) => ({
+        role: (m.role === 'bot' ? 'assistant' : 'user') as 'assistant' | 'user',
+        content: m.text.slice(0, MAX_HISTORY_CONTENT),
+      }));
 
     const userMsg: Message = {
       id: Date.now().toString(),
@@ -45,7 +108,7 @@ export default function Chat() {
     // Studio) interprets the message, calls approved tools if needed, and
     // returns a natural-language answer backed by real SQLite data.
     try {
-      const result = await chatApi.sendMessage(text);
+      const result = await chatApi.sendMessage(text, history);
 
       const botMsg: Message = {
         id: (Date.now() + 1).toString(),
@@ -151,6 +214,7 @@ export default function Chat() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyPress}
               placeholder="Type a message... e.g. '5000 ka kapra becha'"
+              maxLength={2000}
               className="flex-1 px-4 py-3 rounded-xl border border-gray-300 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 outline-none transition-all text-sm"
               disabled={sending}
             />

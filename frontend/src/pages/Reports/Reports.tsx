@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import toast from 'react-hot-toast';
 import { transactionApi, type RangeSummary } from '../../services/api';
-import { formatCurrency, getDateRange } from '../../utils/helpers';
+import { formatCurrency, getDateRange, toLocalDateString } from '../../utils/helpers';
 import { CardSkeleton, ChartSkeleton } from '../../components/LoadingSkeleton';
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
@@ -20,7 +20,7 @@ function getRange(period: string): { from: string; to: string } {
   if (period === 'last3') {
     const now = new Date();
     const from = new Date(now.getFullYear(), now.getMonth() - 2, 1);
-    return { from: from.toISOString().slice(0, 10), to: now.toISOString().slice(0, 10) };
+    return { from: toLocalDateString(from), to: toLocalDateString(now) };
   }
   return getDateRange(period as 'month' | 'year');
 }

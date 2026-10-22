@@ -11,6 +11,35 @@
 // Every function returns { status, body } so HTTP routes can respond directly
 // and AI tool results can be serialized for the model.
 
+// ─── Shared validation helpers ────────────────────────────────────────────────
+
+const MAX_ITEM_LENGTH = 200;
+const MAX_PAYMENT_MODE_LENGTH = 50;
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+// Validates and trims free-text fields so malformed payloads (e.g. objects or
+// empty strings) get a clean 400 instead of reaching SQLite and throwing.
+function normalizeTextFields(item, payment_mode) {
+  if (typeof item !== 'string' || !item.trim()) {
+    return { ok: false, error: 'item must be a non-empty string' };
+  }
+  if (typeof payment_mode !== 'string' || !payment_mode.trim()) {
+    return { ok: false, error: 'payment_mode must be a non-empty string' };
+  }
+
+  const trimmedItem = item.trim();
+  const trimmedPayment = payment_mode.trim();
+
+  if (trimmedItem.length > MAX_ITEM_LENGTH) {
+    return { ok: false, error: `item must be at most ${MAX_ITEM_LENGTH} characters` };
+  }
+  if (trimmedPayment.length > MAX_PAYMENT_MODE_LENGTH) {
+    return { ok: false, error: `payment_mode must be at most ${MAX_PAYMENT_MODE_LENGTH} characters` };
+  }
+
+  return { ok: true, item: trimmedItem, payment_mode: trimmedPayment };
+}
+
 // ─── Create ────────────────────────────────────────────────────────────────────
 function createTransaction(db, data) {
   const { type, amount, item, payment_mode } = data || {};
@@ -26,22 +55,37 @@ function createTransaction(db, data) {
     return { status: 400, body: { error: 'amount must be a positive integer' } };
   }
 
+  const text = normalizeTextFields(item, payment_mode);
+  if (!text.ok) {
+    return { status: 400, body: { error: text.error } };
+  }
+
   const result = db
     .prepare('INSERT INTO transactions (type, amount, item, payment_mode) VALUES (?, ?, ?, ?)')
-    .run(type, amount, item, payment_mode);
+    .run(type, amount, text.item, text.payment_mode);
 
   return {
     status: 201,
     body: {
       message: 'Transaction recorded successfully',
-      transaction: { id: Number(result.lastInsertRowid), type, amount, item, payment_mode },
+      transaction: { id: Number(result.lastInsertRowid), type, amount, item: text.item, payment_mode: text.payment_mode },
     },
   };
 }
 
-// ─── Summary (all-time totals + today's transactions) ──────────────────────────
+// ─── Summary (all-time totals + today's totals + today's transactions) ────────
+// `created_at` is stored in server-local time (datetime('now','localtime')), so
+// "today" must also be computed in local time. Using toISOString() (UTC) points
+// at the previous day between 00:00 and 04:59 PKT and hides today's records.
+function localDateString(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function getSummary(db) {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const today = localDateString(); // YYYY-MM-DD (local)
 
   const totals = db
     .prepare(
@@ -61,12 +105,27 @@ function getSummary(db) {
     )
     .all(today);
 
+  // Today's own totals, summed from the same date-filtered rows. Without these
+  // the AI layer only had all-time totals + a raw list, so it reported the
+  // all-time net_profit as "today's profit".
+  const todayIncome = todaysTransactions.reduce(
+    (sum, t) => (t.type === 'Income' ? sum + t.amount : sum),
+    0
+  );
+  const todayExpense = todaysTransactions.reduce(
+    (sum, t) => (t.type === 'Expense' ? sum + t.amount : sum),
+    0
+  );
+
   return {
     status: 200,
     body: {
       total_income: totals.total_income,
       total_expense: totals.total_expense,
       net_profit: totals.total_income - totals.total_expense,
+      today_income: todayIncome,
+      today_expense: todayExpense,
+      today_net_profit: todayIncome - todayExpense,
       todays_transactions: todaysTransactions,
     },
   };
@@ -76,6 +135,15 @@ function getSummary(db) {
 function getTransactions(db, query) {
   const { type, search, from, to, sort = 'created_at', order = 'desc', page = 1, limit = 20 } = query || {};
 
+  if (search !== undefined && typeof search !== 'string') {
+    return { status: 400, body: { error: 'search must be a single string value' } };
+  }
+  for (const [field, value] of [['from', from], ['to', to]]) {
+    if (value !== undefined && (typeof value !== 'string' || !DATE_PATTERN.test(value))) {
+      return { status: 400, body: { error: `${field} must be a YYYY-MM-DD date string` } };
+    }
+  }
+
   const conditions = [];
   const params = [];
 
@@ -84,8 +152,10 @@ function getTransactions(db, query) {
     params.push(type);
   }
   if (search) {
-    conditions.push('(item LIKE ? OR payment_mode LIKE ?)');
-    params.push(`%${search}%`, `%${search}%`);
+    // Escape LIKE wildcards so user input is matched literally
+    const escaped = search.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    conditions.push(`(item LIKE ? ESCAPE '\\' OR payment_mode LIKE ? ESCAPE '\\')`);
+    params.push(`%${escaped}%`, `%${escaped}%`);
   }
   if (from) {
     conditions.push('DATE(created_at) >= ?');
@@ -102,8 +172,9 @@ function getTransactions(db, query) {
   const sortCol = allowedSorts.includes(sort) ? sort : 'created_at';
   const sortOrder = order === 'asc' ? 'ASC' : 'DESC';
 
-  const pageNum = Math.max(1, parseInt(page) || 1);
-  const limitNum = parseInt(limit) || 20;
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  // Cap the page size so one request can never dump the whole table
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
   const offset = (pageNum - 1) * limitNum;
 
   const total = db
@@ -159,8 +230,13 @@ function updateTransaction(db, id, data) {
     return { status: 400, body: { error: 'amount must be a positive integer' } };
   }
 
+  const text = normalizeTextFields(finalItem, finalPayment);
+  if (!text.ok) {
+    return { status: 400, body: { error: text.error } };
+  }
+
   db.prepare('UPDATE transactions SET type = ?, amount = ?, item = ?, payment_mode = ? WHERE id = ?')
-    .run(finalType, finalAmount, finalItem, finalPayment, id);
+    .run(finalType, finalAmount, text.item, text.payment_mode, id);
 
   return {
     status: 200,
@@ -170,8 +246,8 @@ function updateTransaction(db, id, data) {
         id: Number(id),
         type: finalType,
         amount: finalAmount,
-        item: finalItem,
-        payment_mode: finalPayment,
+        item: text.item,
+        payment_mode: text.payment_mode,
       },
     },
   };
@@ -190,6 +266,9 @@ function deleteTransaction(db, id) {
 function getSummaryRange(db, from, to) {
   if (!from || !to) {
     return { status: 400, body: { error: 'Both from and to query params are required (YYYY-MM-DD)' } };
+  }
+  if (typeof from !== 'string' || !DATE_PATTERN.test(from) || typeof to !== 'string' || !DATE_PATTERN.test(to)) {
+    return { status: 400, body: { error: 'from and to must be YYYY-MM-DD date strings' } };
   }
 
   const totals = db

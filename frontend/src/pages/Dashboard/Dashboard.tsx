@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { TrendingUp, TrendingDown, Wallet, ArrowUpRight, Plus, ArrowLeftRight, MessageCircle } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import toast from 'react-hot-toast';
-import { transactionApi, type Summary, type RangeSummary } from '../../services/api';
+import { transactionApi, getApiErrorMessage, type Summary, type RangeSummary } from '../../services/api';
 import { formatCurrency, formatDate, getDateRange } from '../../utils/helpers';
 import StatCard from '../../components/StatCard';
 import TransactionForm from '../../components/TransactionForm';
@@ -29,9 +29,10 @@ export default function Dashboard() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
+      const range = getDateRange(period);
       const [summaryRes, rangeRes] = await Promise.all([
         transactionApi.getSummary(),
-        transactionApi.getRangeSummary(...Object.values(getDateRange(period))),
+        transactionApi.getRangeSummary(range.from, range.to),
       ]);
       setSummary(summaryRes);
       setRangeData(rangeRes);
@@ -50,8 +51,8 @@ export default function Dashboard() {
       toast.success('Transaction added successfully');
       setShowForm(false);
       fetchData();
-    } catch {
-      toast.error('Failed to add transaction');
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, 'Failed to add transaction. Please try again.'));
     }
   };
 

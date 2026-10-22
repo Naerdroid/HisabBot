@@ -1,13 +1,56 @@
-import { User, Globe, Bell, Shield, Info } from 'lucide-react';
+import { User, Info } from 'lucide-react';
 import { useState } from 'react';
 
+const SETTINGS_KEY = 'hisabbot.settings';
+
+interface StoredSettings {
+  displayName: string;
+  email: string;
+}
+
+function readStoredSettings(): StoredSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StoredSettings>;
+      return {
+        displayName:
+          typeof parsed.displayName === 'string' && parsed.displayName.trim()
+            ? parsed.displayName
+            : 'User',
+        email: typeof parsed.email === 'string' ? parsed.email : '',
+      };
+    }
+  } catch {
+    // Ignore unreadable or malformed stored settings and fall back to defaults
+  }
+  return { displayName: 'User', email: '' };
+}
+
 export default function SettingsPage() {
-  const [currency, setCurrency] = useState('PKR');
+  const [displayName, setDisplayName] = useState(() => readStoredSettings().displayName);
+  const [email, setEmail] = useState(() => readStoredSettings().email);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   const handleSave = () => {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    const settings: StoredSettings = {
+      displayName: displayName.trim() || 'User',
+      email: email.trim(),
+    };
+
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      setDisplayName(settings.displayName);
+      setEmail(settings.email);
+      setSaveError('');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      // Persisting failed (e.g. storage disabled) — never claim success
+      setSaved(false);
+      setSaveError('Could not save changes. Please try again.');
+    }
   };
 
   return (
@@ -28,10 +71,10 @@ export default function SettingsPage() {
         <div className="p-6 space-y-4">
           <div className="flex items-center gap-4">
             <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-primary-100 text-primary-600 text-2xl font-bold">
-              U
+              {displayName.trim().charAt(0).toUpperCase() || 'U'}
             </div>
             <div>
-              <p className="text-sm font-medium text-gray-900">User</p>
+              <p className="text-sm font-medium text-gray-900">{displayName.trim() || 'User'}</p>
               <p className="text-sm text-gray-400">Personal Account</p>
             </div>
           </div>
@@ -40,7 +83,9 @@ export default function SettingsPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1.5">Display Name</label>
               <input
                 type="text"
-                defaultValue="User"
+                value={displayName}
+                onChange={(e) => { setDisplayName(e.target.value); setSaved(false); }}
+                placeholder="User"
                 className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 outline-none transition-all text-sm"
               />
             </div>
@@ -48,43 +93,25 @@ export default function SettingsPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1.5">Email</label>
               <input
                 type="email"
-                defaultValue="user@example.com"
+                value={email}
+                onChange={(e) => { setEmail(e.target.value); setSaved(false); }}
+                placeholder="user@example.com"
                 className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 outline-none transition-all text-sm"
               />
             </div>
           </div>
-        </div>
-      </div>
-
-      {/* Preferences */}
-      <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-        <div className="px-6 py-4 border-b border-gray-100">
-          <h2 className="text-base font-semibold text-gray-900 flex items-center gap-2">
-            <Globe size={18} className="text-gray-400" />
-            Preferences
-          </h2>
-        </div>
-        <div className="p-6 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1.5">Currency</label>
-            <select
-              value={currency}
-              onChange={(e) => setCurrency(e.target.value)}
-              className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 outline-none transition-all text-sm bg-white"
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleSave}
+              className="px-5 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-medium rounded-xl shadow-lg shadow-primary-600/25 transition-all"
             >
-              <option value="PKR">PKR - Pakistani Rupee</option>
-              <option value="USD">USD - US Dollar</option>
-              <option value="INR">INR - Indian Rupee</option>
-              <option value="EUR">EUR - Euro</option>
-              <option value="GBP">GBP - British Pound</option>
-            </select>
+              Save Changes
+            </button>
+            <span aria-live="polite" className="text-sm">
+              {saved && <span className="text-emerald-600">Saved!</span>}
+              {saveError && <span className="text-red-600">{saveError}</span>}
+            </span>
           </div>
-          <button
-            onClick={handleSave}
-            className="px-5 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-medium rounded-xl shadow-lg shadow-primary-600/25 transition-all"
-          >
-            {saved ? 'Saved!' : 'Save Changes'}
-          </button>
         </div>
       </div>
 

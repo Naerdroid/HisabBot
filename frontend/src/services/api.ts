@@ -73,6 +73,14 @@ export interface ChatResponse {
   tools_used: string[];
 }
 
+// One prior conversation turn sent along with a new chat message, so the
+// backend model can resolve follow-ups like "5000 ka" against a pending
+// transaction from the previous message.
+export interface ChatHistoryEntry {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 // ─── API Calls ─────────────────────────────────────────────────────────────────
 
 export const transactionApi = {
@@ -98,8 +106,20 @@ export const transactionApi = {
 };
 
 export const chatApi = {
-  sendMessage: (message: string) =>
-    chatClient.post<ChatResponse>('/chat', { message }).then((r) => r.data),
+  sendMessage: (message: string, history: ChatHistoryEntry[] = []) =>
+    chatClient.post<ChatResponse>('/chat', { message, history }).then((r) => r.data),
 };
+
+// ─── Error helper ──────────────────────────────────────────────────────────────
+
+/**
+ * Extracts a readable message from an axios error.
+ * The backend returns { error: string } for validation and server failures,
+ * so prefer that message over a generic fallback.
+ */
+export function getApiErrorMessage(err: unknown, fallback: string): string {
+  const serverError = (err as { response?: { data?: { error?: unknown } } })?.response?.data?.error;
+  return typeof serverError === 'string' && serverError.trim() ? serverError : fallback;
+}
 
 export default api;

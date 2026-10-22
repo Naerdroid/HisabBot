@@ -1,6 +1,7 @@
 const express = require('express');
 const Database = require('better-sqlite3');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const path = require('path');
 
 // Shared business/data layer — used by BOTH the REST routes below and the
@@ -19,11 +20,49 @@ const {
 const { processChatMessage } = require('./services/qwenAgent');
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_CHAT_MESSAGE_LENGTH = 2000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ─── Security & reliability middleware ────────────────────────────────────────
+
+// Don't advertise the framework in response headers
+app.disable('x-powered-by');
+
+// Only the local frontend may call this API from a browser.
+// The Vite dev proxy is same-origin and needs no CORS at all, so this list
+// stays minimal. Requests without an Origin header (curl, health checks,
+// server-to-server calls) are allowed — they are not browser-driven.
+const ALLOWED_ORIGINS = new Set(['http://localhost:5173', 'http://127.0.0.1:5173']);
+app.use(
+  cors({
+    origin(origin, callback) {
+      callback(null, !origin || ALLOWED_ORIGINS.has(origin));
+    },
+  })
+);
+
+// Every valid request body is small; reject oversized payloads early
+app.use(express.json({ limit: '16kb' }));
+
+// Rate limiting protects the API (and especially the expensive AI endpoint)
+// from abuse and runaway loops. Defaults are generous for a local demo and
+// can be overridden with environment variables for testing.
+const RATE_LIMIT_MESSAGE = { error: 'Too many requests. Please wait a moment and try again.' };
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.RATE_LIMIT_PER_MINUTE) || 120,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: RATE_LIMIT_MESSAGE,
+});
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.CHAT_RATE_LIMIT_PER_MINUTE) || 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: RATE_LIMIT_MESSAGE,
+});
+app.use('/api', apiLimiter);
 
 // ─── Database Setup ────────────────────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'hisab.db');
@@ -100,17 +139,23 @@ app.get('/api/summary/range', (req, res) => {
 // Flow: user message → Qwen (LM Studio) → optional approved tool calls →
 // transactionService → SQLite → tool results back to Qwen → final answer.
 //
-// Body:     { message: string }
+// Body:     { message: string, history?: Array<{ role: 'user'|'assistant', content: string }> }
+//           The optional history carries the recent conversation turns so the
+//           model can resolve follow-ups (e.g. "5000 ka" → the pending expense).
+//           It is validated and capped inside processChatMessage.
 // Response: { response: string, tools_used: string[] }
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', chatLimiter, async (req, res) => {
   try {
-    const { message } = req.body || {};
+    const { message, history } = req.body || {};
 
     if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Message is required' });
     }
+    if (message.length > MAX_CHAT_MESSAGE_LENGTH) {
+      return res.status(400).json({ error: `Message is too long (max ${MAX_CHAT_MESSAGE_LENGTH} characters)` });
+    }
 
-    const result = await processChatMessage(db, message.trim());
+    const result = await processChatMessage(db, message.trim(), history);
     res.json(result);
   } catch (err) {
     // Log technical details server-side only; never leak stack traces to the client
@@ -130,7 +175,26 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ─── Error handler ────────────────────────────────────────────────────────────
+// Catches unexpected route errors (e.g. malformed payloads that reach SQLite)
+// and returns clean JSON. Stack traces stay in the server log; clients never
+// receive implementation details.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  if (err.type === 'entity.parse.failed' || err.status === 400) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+  if (err.type === 'entity.too.large' || err.status === 413) {
+    return res.status(413).json({ error: 'Request body is too large' });
+  }
+
+  console.error(`Unexpected error on ${req.method} ${req.path}:`, err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`HisabBot backend running on http://localhost:${PORT}`);
+// Bind to loopback only: this API is for this machine, not the local network.
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`HisabBot backend running on http://127.0.0.1:${PORT}`);
 });

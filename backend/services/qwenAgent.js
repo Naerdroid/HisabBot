@@ -37,6 +37,19 @@ const REQUEST_TIMEOUT_MS = 120000; // local models can be slow on first token
 // Hard cap on tool-call rounds per user message (prevents infinite loops)
 const MAX_TOOL_ITERATIONS = 5;
 
+// Conversation history sent by the frontend with each message (so follow-ups
+// like "5000 ka" can be resolved against a pending transaction). Capped in
+// count and length so history can never blow up the request or the prompt.
+const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_CONTENT_LENGTH = 2000;
+
+// The recap is embedded in the user's message rather than sent as separate
+// conversation turns: small local models attend far better to the latest user
+// message, and a preceding "assistant" turn can trigger them to imitate an old
+// confirmation instead of calling the tool for the new request.
+const RECAP_TURNS = 4;
+const RECAP_CONTENT_LIMIT = 600;
+
 // ─── System Prompt ─────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are HisabBot, an AI accounting assistant for a small business.
@@ -82,7 +95,7 @@ STRICT RULES:
 
 4. DATE AND PERIOD HANDLING
    - The current date is provided in the user's message as [Current date: YYYY-MM-DD].
-   - For "today", ALWAYS use get_summary_range with from = today's date and to = today's date when the user is asking for today's income, expense, profit, or financial totals.
+   - For "today", use get_summary (it returns today_income, today_expense and today_net_profit) or get_summary_range with from = today's date and to = today's date. Both return today's exact figures.
    - For "today's transactions", get_transactions may be used with from = today's date and to = today's date.
    - For "yesterday", use get_summary_range with the previous date as both from and to.
    - For "this week", use get_summary_range with the appropriate week start and today's date.
@@ -130,7 +143,7 @@ STRICT RULES:
 
 9. SUMMARIES
 
-   * Use get_summary for overall/all-time financial summary and today's transactions when appropriate.
+   * Use get_summary for overall/all-time totals AND today's figures — it returns today_income, today_expense and today_net_profit alongside the all-time totals.
    * Use get_summary_range for a specific date range or period.
    * If the user asks "What is my total income?", use the appropriate summary tool and report the exact returned total.
    * If the user asks "How much did I earn today?", make sure the answer uses today's data, not the all-time total.
@@ -154,7 +167,7 @@ STRICT RULES:
 * Use tools whenever actual database information is required.
 * If a tool returns an error, honestly tell the user that the requested operation could not be completed.
 
-12. MISSING INFORMATION
+12. MISSING INFORMATION AND PENDING TRANSACTIONS
 
 * If required information is missing, ask a concise clarification question.
 * Do not guess important financial information.
@@ -162,6 +175,24 @@ STRICT RULES:
   User: "I sold some kapra."
   Correct response: ask for the amount.
 * Do not call create_transaction until all required information is available.
+
+PENDING TRANSACTIONS (MULTI-MESSAGE FLOW):
+
+* The user's new message arrives with a "[Recent conversation for context]" recap above it. Use that context.
+* If the recap shows an incomplete transaction and the user's new message supplies the missing information, COMBINE them into ONE transaction.
+* Ask ONLY for information that is still missing. Never re-ask for details the user already gave.
+* Keep the transaction type already established: if the user earlier said they bought, paid or spent something (Expense), a follow-up message that only gives an amount is still that Expense. It is NEVER Income.
+* A reply such as "5000 ka", "5000" or "five thousand" after you asked for the amount means PKR 5000 for that pending transaction.
+* Only call create_transaction once the combined information is complete.
+* Every user message is a NEW request. Even if the recap shows a transaction that was already recorded, a newly reported transaction still requires a NEW create_transaction call in THIS turn.
+* Never imitate or repeat a confirmation message from the recap. Only confirm a recording when THIS turn's create_transaction result confirms success.
+* Example:
+  User: "maine kapra khareeda"
+  You: ask for the amount.
+  User: "5000 ka"
+  Correct: call create_transaction with type "Expense", amount 5000, item "kapra", payment_mode "Cash".
+  Wrong: asking again whether it is Income or Expense.
+  Wrong: recording it as Income.
 
 13. LANGUAGE RULE:
 Always match the user's language.
@@ -176,6 +207,7 @@ Examples:
 
 Do NOT randomly switch languages.
 Do NOT use Arabic for an English or Roman Urdu user.
+Reply in the same language and script the user writes in. If they write Roman Urdu, reply in Roman Urdu. Never switch to Devanagari unless the user does.
 
 14. FINANCIAL FORMATTING
 
@@ -202,12 +234,13 @@ Do NOT use Arabic for an English or Roman Urdu user.
 
 17. TODAY'S HISAB IS DIFFERENT FROM OVERALL HISAB
    - When the user asks "aaj ka hisab", "today's hisab", "aaj ki income", "aaj ka expense", or similar, the primary answer MUST describe TODAY only.
-   - The all-time totals returned by get_summary MUST NOT be presented as today's income, today's expense, or today's profit.
-   - get_summary contains both:
+   - get_summary returns TWO separate sets of figures:
        * ALL-TIME totals: total_income, total_expense, net_profit
-       * TODAY'S transactions: today's transactions list
-   - If today's transaction list is empty, explicitly say that there are no transactions today.
-   - When there are no transactions today, report today's income, expense and profit as PKR 0 unless the tool provides separate non-zero daily totals.
+       * TODAY-ONLY totals: today_income, today_expense, today_net_profit (plus the today transactions list)
+   - For any "today" question, report today_income, today_expense and today_net_profit EXACTLY as returned by the tool.
+   - NEVER use the all-time net_profit as today's profit.
+   - Do not calculate today's profit yourself — today_net_profit is already provided by the tool.
+   - If today's totals are 0, say there are no transactions today and report PKR 0 exactly.
    - Only mention all-time totals as additional information and clearly label them as "overall" or "all-time".
 
 Before every financial answer, internally verify:
@@ -229,7 +262,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'create_transaction',
-      description: 'Record a new financial transaction (Income or Expense) in the database. Use when the user reports selling/earning (Income) or spending/paying (Expense) with a complete amount and item.',
+      description: 'Record a new financial transaction (Income or Expense) in the database. Use when the user reports selling/earning (Income) or spending/paying (Expense) with a complete amount and item. If the user described part of the transaction in an earlier message (e.g. the item) and the latest message supplies the rest (e.g. the amount), combine the messages and record ONE transaction.',
       parameters: {
         type: 'object',
         properties: {
@@ -246,7 +279,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'get_summary',
-      description: "Get the overall/all-time financial totals AND a separate list of TODAY\\'S transactions. IMPORTANT: total_income, total_expense and net_profit are ALL-TIME values, NOT today\\'s values. The today transactions list is separate. Use this tool for overall totals or when the user asks for today\\'s transactions.",
+      description: "Get all-time financial totals AND today\\'s figures in one call. ALL-TIME fields: total_income, total_expense, net_profit. TODAY-ONLY fields: today_income, today_expense, today_net_profit, plus the list of today\\'s transactions. For any question about today (today\\'s hisab, income, expense or profit), report the today_* fields exactly. NEVER present the all-time net_profit as today\\'s profit.",
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -522,6 +555,69 @@ function sanitizeRangeArgs(raw) {
   return { ok: true, args: { from: raw.from, to: raw.to } };
 }
 
+// ─── Conversation History Sanitizer ────────────────────────────────────────────
+// History entries come from the client and are never trusted blindly: keep only
+// well-formed user/assistant turns, capped in count and content length.
+
+function sanitizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+
+  const clean = [];
+  for (const entry of history) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.role !== 'user' && entry.role !== 'assistant') continue;
+    if (typeof entry.content !== 'string' || !entry.content.trim()) continue;
+    clean.push({
+      role: entry.role,
+      content: entry.content.slice(0, MAX_HISTORY_CONTENT_LENGTH),
+    });
+  }
+  return clean.slice(-MAX_HISTORY_MESSAGES);
+}
+
+// Format the last few turns as a plain-text recap for the user message.
+// Assistant replies that claim a transaction was recorded are replaced with a
+// short neutral note: the full "Transaction recorded successfully…" template
+// is the strongest trigger for the model to imitate a confirmation instead of
+// calling create_transaction for a new request, but dropping the turn
+// entirely would leave the preceding user message looking unresolved. The
+// note keeps the state clear without offering a template to copy.
+function buildRecap(history) {
+  return history
+    .slice(-RECAP_TURNS)
+    .map((m) => {
+      if (m.role === 'assistant' && claimsRecording(m.content)) {
+        return '(The transaction discussed above was completed and saved.)';
+      }
+      const label = m.role === 'user' ? 'User' : 'Assistant';
+      const content =
+        m.content.length > RECAP_CONTENT_LIMIT
+          ? `${m.content.slice(0, RECAP_CONTENT_LIMIT)}…`
+          : m.content;
+      return `${label}: ${content}`;
+    })
+    .join('\n');
+}
+
+// ─── Response Integrity Check ──────────────────────────────────────────────────
+// Small models sometimes imitate an earlier confirmation ("Transaction recorded
+// successfully…") instead of actually calling create_transaction, producing a
+// false success claim with nothing saved. The agent loop detects that mismatch
+// (claim without a create_transaction call in THIS turn) and gives the model
+// one corrective round to either really record the transaction or re-answer.
+
+const RECORD_CLAIM_PATTERN =
+  /(recorded|saved)\s+(successfully|in the database)|(has\s+been|been)\s+(recorded|saved)|transaction\s+(was\s+)?(recorded|saved)|(record|save)\s*(ho\s*gaya|kar\s*diya)/i;
+
+function claimsRecording(text) {
+  return RECORD_CLAIM_PATTERN.test(text);
+}
+
+const INTEGRITY_CHECK_MESSAGE =
+  "[System integrity check] You did not call create_transaction in this conversation turn, so NOTHING was saved in this turn. Your previous reply claiming a successful recording was incorrect. " +
+  "If the user's latest message reports a transaction that has not been saved yet, call create_transaction now with its complete details. " +
+  "If you are unsure whether it was saved earlier, use get_transactions to check — do NOT create a duplicate.";
+
 // ─── Tool Execution ────────────────────────────────────────────────────────────
 // Every path goes through transactionService — the single SQLite access layer.
 // Qwen never receives a db handle and can never construct SQL.
@@ -593,9 +689,10 @@ function executeTool(db, name, rawArgs) {
  *
  * @param {object} db      - better-sqlite3 instance (used only by approved tools)
  * @param {string} message - the user's message text
+ * @param {Array}  history - optional prior turns: [{ role: 'user'|'assistant', content }]
  * @returns {{ response: string, tools_used: string[] }}
  */
-async function processChatMessage(db, message) {
+async function processChatMessage(db, message, history = []) {
 
   const today = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Karachi',
@@ -604,20 +701,55 @@ async function processChatMessage(db, message) {
   day: '2-digit',
 }).format(new Date());
 
+  const sanitizedHistory = sanitizeHistory(history);
+  // buildRecap drops assistant confirmations, so it can be empty even when
+  // history exists — in that case the new message stands on its own.
+  const recap = sanitizedHistory.length > 0 ? buildRecap(sanitizedHistory) : '';
+
+  let userContent;
+  if (recap) {
+    userContent =
+      `[Current date: ${today}]\n\n` +
+      `[Recent conversation for context — the user's new message below continues this conversation]\n` +
+      `${recap}\n\n` +
+      `[The user's new message]\n${message}`;
+  } else {
+    userContent = `[Current date: ${today}]\n\n${message}`;
+  }
+
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: `[Current date: ${today}]\n\n${message}` },
+    { role: 'user', content: userContent },
   ];
 
   const toolsUsed = [];
+  let integrityChecked = false; // the corrective round runs at most once
 
   for (let round = 0; round < MAX_TOOL_ITERATIONS; round++) {
     const assistantMsg = await callQwen(messages, TOOLS);
 
-    // Plain answer (no tool calls) → we are done
+    // Plain answer (no tool calls) → we are done, unless the answer claims a
+    // recording that never happened this turn (claimsRecording detects the
+    // mismatch). One corrective round lets the model actually call
+    // create_transaction — see the Response Integrity Check section above.
     if (!assistantMsg.tool_calls) {
+      const response =
+        assistantMsg.content.trim() || 'Maazrat, main jawab generate nahi kar saka. Please dobara try karein.';
+
+      if (
+        !integrityChecked &&
+        round < MAX_TOOL_ITERATIONS - 2 &&
+        !toolsUsed.includes('create_transaction') &&
+        claimsRecording(response)
+      ) {
+        integrityChecked = true;
+        messages.push(assistantMsg);
+        messages.push({ role: 'user', content: INTEGRITY_CHECK_MESSAGE });
+        continue;
+      }
+
       return {
-        response: assistantMsg.content.trim() || 'Maazrat, main jawab generate nahi kar saka. Please dobara try karein.',
+        response,
         tools_used: toolsUsed,
       };
     }
