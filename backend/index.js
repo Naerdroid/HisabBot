@@ -3,6 +3,7 @@ const Database = require('better-sqlite3');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const { createTranscriptionRouter } = require('./routes/transcription');
 
 // Shared business/data layer — used by BOTH the REST routes below and the
 // Qwen AI tools, so there is exactly one source of validation + SQLite logic.
@@ -61,6 +62,13 @@ const chatLimiter = rateLimit({
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   message: RATE_LIMIT_MESSAGE,
+});
+const transcriptionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many transcription requests. Please wait a moment and try again.' },
 });
 app.use('/api', apiLimiter);
 
@@ -126,12 +134,17 @@ app.delete('/api/transactions/:id', (req, res) => {
 });
 
 // ─── GET /api/summary/range ────────────────────────────────────────────────────
-// Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD
+// Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD&item=keyword&type=Income|Expense
 // Returns totals and daily breakdown for charts within a date range
 app.get('/api/summary/range', (req, res) => {
-  const { status, body } = getSummaryRange(db, req.query.from, req.query.to);
+  const { status, body } = getSummaryRange(db, req.query.from, req.query.to, req.query);
   res.status(status).json(body);
 });
+
+// ─── POST /api/transcribe ─────────────────────────────────────────────────────
+// Multipart: audio=<recording>, language=auto|en|ur
+// Upload storage and local inference are isolated from chat and transaction APIs.
+app.use('/api/transcribe', transcriptionLimiter, createTranscriptionRouter());
 
 // ─── POST /api/chat ────────────────────────────────────────────────────────────
 // AI chatbot endpoint backed by the local Qwen model via LM Studio.

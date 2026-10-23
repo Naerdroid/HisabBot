@@ -14,6 +14,12 @@ const chatClient = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+// Transcription has bounded 30-second audio input but can take longer than normal API calls.
+const transcriptionClient = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || '/api',
+  timeout: 120000,
+});
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 export interface Transaction {
@@ -73,9 +79,14 @@ export interface ChatResponse {
   tools_used: string[];
 }
 
-// One prior conversation turn sent along with a new chat message, so the
-// backend model can resolve follow-ups like "5000 ka" against a pending
-// transaction from the previous message.
+export type TranscriptionLanguage = 'auto' | 'en' | 'ur';
+
+export interface TranscriptionResponse {
+  success: true;
+  text: string;
+  language?: 'en' | 'ur';
+}
+
 export interface ChatHistoryEntry {
   role: 'user' | 'assistant';
   content: string;
@@ -107,7 +118,20 @@ export const transactionApi = {
 
 export const chatApi = {
   sendMessage: (message: string, history: ChatHistoryEntry[] = []) =>
-    chatClient.post<ChatResponse>('/chat', { message, history }).then((r) => r.data),
+    chatClient.post<ChatResponse>('/chat', { message, ...(history.length ? { history } : {}) }).then((r) => r.data),
+};
+
+export const voiceApi = {
+  transcribe: (audio: Blob, language: TranscriptionLanguage) => {
+    const formData = new FormData();
+    const mime = audio.type.split(';', 1)[0].toLowerCase();
+    const extension = mime === 'audio/ogg' ? 'ogg' : mime === 'audio/mp4' ? 'mp4' : 'webm';
+    formData.append('audio', audio, `recording.${extension}`);
+    formData.append('language', language);
+    return transcriptionClient
+      .post<TranscriptionResponse>('/transcribe', formData)
+      .then((response) => response.data);
+  },
 };
 
 // ─── Error helper ──────────────────────────────────────────────────────────────

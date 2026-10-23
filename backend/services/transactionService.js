@@ -17,6 +17,49 @@ const MAX_ITEM_LENGTH = 200;
 const MAX_PAYMENT_MODE_LENGTH = 50;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+const ITEM_ALIAS_GROUPS = [
+  ['clothes', 'clothing', 'garment', 'garments', 'کپڑا', 'کپڑے', 'کپڑوں', 'kapra', 'kapray', 'kapre'],
+  ['food', 'meal', 'meals', 'کھانا', 'کھانے', 'khana', 'khane', 'khanay'],
+  ['groceries', 'grocery', 'راشن', 'rashan'],
+  ['petrol', 'fuel', 'پٹرول', 'پیٹرول', 'petroleum'],
+  ['electricity', 'electric bill', 'بجلی', 'bijli'],
+  ['rent', 'کرایہ', 'kiraya'],
+  ['salary', 'تنخواہ', 'tankhwa', 'tankhwah'],
+];
+
+function normalizeItemName(item) {
+  return item.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+function getItemAliases(item) {
+  const normalizedItem = normalizeItemName(item);
+  const group = ITEM_ALIAS_GROUPS.find((aliases) =>
+    aliases.some((alias) => normalizeItemName(alias) === normalizedItem)
+  );
+  return group || [item.trim()];
+}
+
+function findItemAlias(text) {
+  const words = normalizeItemName(text).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  for (const aliases of ITEM_ALIAS_GROUPS) {
+    for (const alias of aliases) {
+      const aliasWords = normalizeItemName(alias).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+      if (aliasWords.length > 0 && words.some((_, index) =>
+        aliasWords.every((word, offset) => words[index + offset] === word)
+      )) {
+        return aliases[0];
+      }
+    }
+  }
+  return undefined;
+}
+
+function addExactItemCondition(conditions, params, item) {
+  const aliases = getItemAliases(item);
+  conditions.push(`TRIM(item) COLLATE NOCASE IN (${aliases.map(() => '?').join(', ')})`);
+  params.push(...aliases);
+}
+
 // Validates and trims free-text fields so malformed payloads (e.g. objects or
 // empty strings) get a clean 400 instead of reaching SQLite and throwing.
 function normalizeTextFields(item, payment_mode) {
@@ -152,10 +195,19 @@ function getTransactions(db, query) {
     params.push(type);
   }
   if (search) {
-    // Escape LIKE wildcards so user input is matched literally
-    const escaped = search.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-    conditions.push(`(item LIKE ? ESCAPE '\\' OR payment_mode LIKE ? ESCAPE '\\')`);
-    params.push(`%${escaped}%`, `%${escaped}%`);
+    const aliases = ITEM_ALIAS_GROUPS.find((group) =>
+      group.some((alias) => normalizeItemName(alias) === normalizeItemName(search))
+    );
+    if (aliases) {
+      conditions.push(`(TRIM(item) COLLATE NOCASE IN (${aliases.map(() => '?').join(', ')}) OR payment_mode LIKE ? ESCAPE '\\')`);
+      // Escape LIKE wildcards so payment-mode text is matched literally.
+      params.push(...aliases, `%${search.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`);
+    } else {
+      // Escape LIKE wildcards so user input is matched literally.
+      const escaped = search.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+      conditions.push(`(item LIKE ? ESCAPE '\\' OR payment_mode LIKE ? ESCAPE '\\')`);
+      params.push(`%${escaped}%`, `%${escaped}%`);
+    }
   }
   if (from) {
     conditions.push('DATE(created_at) >= ?');
@@ -263,12 +315,75 @@ function deleteTransaction(db, id) {
 }
 
 // ─── Date-range summary (totals + daily + per-item breakdown) ──────────────────
-function getSummaryRange(db, from, to) {
+function getSummaryRange(db, from, to, filters = {}) {
   if (!from || !to) {
     return { status: 400, body: { error: 'Both from and to query params are required (YYYY-MM-DD)' } };
   }
   if (typeof from !== 'string' || !DATE_PATTERN.test(from) || typeof to !== 'string' || !DATE_PATTERN.test(to)) {
     return { status: 400, body: { error: 'from and to must be YYYY-MM-DD date strings' } };
+  }
+
+  const { item, type } = filters;
+  if (item !== undefined && (typeof item !== 'string' || !item.trim())) {
+    return { status: 400, body: { error: 'item must be a non-empty string' } };
+  }
+  if (type !== undefined && !['Income', 'Expense'].includes(type)) {
+    return { status: 400, body: { error: "type must be 'Income' or 'Expense'" } };
+  }
+
+  const conditions = ['DATE(created_at) >= ?', 'DATE(created_at) <= ?'];
+  const params = [from, to];
+  if (item !== undefined) addExactItemCondition(conditions, params, item);
+  if (type !== undefined) {
+    conditions.push('type = ?');
+    params.push(type);
+  }
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  if (item !== undefined) {
+    const transactions = db
+      .prepare(
+        `SELECT id, type, amount, item, created_at
+         FROM transactions
+         ${whereClause}
+         ORDER BY created_at ASC, id ASC`
+      )
+      .all(...params);
+    const totalIncome = transactions.reduce(
+      (sum, transaction) => sum + (transaction.type === 'Income' ? transaction.amount : 0),
+      0
+    );
+    const totalExpense = transactions.reduce(
+      (sum, transaction) => sum + (transaction.type === 'Expense' ? transaction.amount : 0),
+      0
+    );
+    const dailyMap = new Map();
+    const itemMap = new Map();
+
+    for (const transaction of transactions) {
+      const date = transaction.created_at.slice(0, 10);
+      const daily = dailyMap.get(date) || { date, income: 0, expense: 0 };
+      daily[transaction.type === 'Income' ? 'income' : 'expense'] += transaction.amount;
+      dailyMap.set(date, daily);
+
+      const itemKey = `${transaction.type}\0${transaction.item}`;
+      const byItem = itemMap.get(itemKey) || { type: transaction.type, item: transaction.item, total: 0 };
+      byItem.total += transaction.amount;
+      itemMap.set(itemKey, byItem);
+    }
+
+    return {
+      status: 200,
+      body: {
+        total_income: totalIncome,
+        total_expense: totalExpense,
+        net_profit: totalIncome - totalExpense,
+        daily_breakdown: [...dailyMap.values()],
+        by_item: [...itemMap.values()].sort((a, b) => b.total - a.total),
+        transactions,
+        filters: { from, to, item, ...(type ? { type } : {}) },
+      },
+    };
   }
 
   const totals = db
@@ -277,9 +392,9 @@ function getSummaryRange(db, from, to) {
          COALESCE(SUM(CASE WHEN type = 'Income'  THEN amount ELSE 0 END), 0) AS total_income,
          COALESCE(SUM(CASE WHEN type = 'Expense' THEN amount ELSE 0 END), 0) AS total_expense
        FROM transactions
-       WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?`
+       ${whereClause}`
     )
-    .get(from, to);
+    .get(...params);
 
   const daily = db
     .prepare(
@@ -287,21 +402,21 @@ function getSummaryRange(db, from, to) {
          COALESCE(SUM(CASE WHEN type = 'Income'  THEN amount ELSE 0 END), 0) AS income,
          COALESCE(SUM(CASE WHEN type = 'Expense' THEN amount ELSE 0 END), 0) AS expense
        FROM transactions
-       WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
+       ${whereClause}
        GROUP BY DATE(created_at)
        ORDER BY date ASC`
     )
-    .all(from, to);
+    .all(...params);
 
   const byItem = db
     .prepare(
       `SELECT type, item, SUM(amount) AS total
        FROM transactions
-       WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
+       ${whereClause}
        GROUP BY type, item
        ORDER BY total DESC`
     )
-    .all(from, to);
+    .all(...params);
 
   return {
     status: 200,
@@ -323,4 +438,5 @@ module.exports = {
   updateTransaction,
   deleteTransaction,
   getSummaryRange,
+  findItemAlias,
 };

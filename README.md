@@ -80,6 +80,10 @@ HisabBot can calculate:
 
 Financial records are stored locally using SQLite through `better-sqlite3`.
 
+### Local Voice Input
+
+The Chat page can transcribe short microphone recordings locally with Whisper.cpp. The transcript is inserted into the editable input and is only sent after the user clicks **Send**. See [Local Voice Input (Whisper.cpp)](#local-voice-input-whispercpp) for setup and limits.
+
 ---
 
 # System Architecture
@@ -291,16 +295,60 @@ npm run dev
 
 # Environment Configuration
 
-Create a `.env` file if you want to customize the AI configuration.
+The backend reads configuration from `process.env`; it does not load `.env` files itself. In PowerShell, set values in the backend terminal before starting Node. For example:
 
-Example:
-
-```env
-LM_STUDIO_URL=http://localhost:1234
-QWEN_MODEL=qwen2.5-7b-instruct
+```powershell
+$env:LM_STUDIO_URL = 'http://localhost:1234'
+$env:QWEN_MODEL = 'qwen2.5-7b-instruct'
+npm start
 ```
 
-For security, `.env` is excluded from Git.
+These variables apply only to that terminal session. Do not put credentials in source control.
+
+---
+
+# Local Voice Input (Whisper.cpp)
+
+The Chat page can record a short microphone clip and transcribe it locally before placing the transcript into the editable chat input. Transcription never sends the chat or creates a transaction; review the text and click **Send** yourself.
+
+## Local tools
+
+Install Whisper.cpp's `whisper-cli.exe`, a multilingual GGML Whisper model, FFmpeg, and FFprobe on this computer. The initial Windows defaults are:
+
+| PowerShell environment variable | Default |
+| --- | --- |
+| `WHISPER_CPP_CLI_PATH` | `C:\Users\Lenovo\AI\whisper.cpp\build\bin\Release\whisper-cli.exe` |
+| `WHISPER_MODEL_PATH` | `C:\Users\Lenovo\AI\models\ggml-base.bin` |
+| `FFMPEG_PATH` | `C:\Users\Lenovo\AI\ffmpeg\extract\ffmpeg-n8.1-latest-win64-lgpl-shared-8.1\bin\ffmpeg.exe` |
+
+FFprobe is expected beside FFmpeg as `ffprobe.exe`. Set a `FFPROBE_PATH` process environment variable only if it is stored elsewhere. To override a path, set the variable in the same PowerShell terminal used to launch the backend, then run `npm start` from `backend`. The backend reads process environment variables directly; it does **not** load `.env` files.
+
+Example override:
+
+```powershell
+$env:WHISPER_CPP_CLI_PATH = 'C:\Tools\whisper.cpp\whisper-cli.exe'
+$env:WHISPER_MODEL_PATH = 'C:\Tools\whisper.cpp\models\ggml-base.bin'
+$env:FFMPEG_PATH = 'C:\Tools\ffmpeg\bin\ffmpeg.exe'
+npm start
+```
+
+## Browser and limits
+
+Use a current Chrome or Edge browser with microphone permission granted. Browser microphone capture requires a secure context; `localhost` is allowed for local development. Recordings stop at 30 seconds. The local endpoint accepts one supported audio file up to 10 MB, then probes and converts it to mono, 16 kHz, signed 16-bit PCM WAV before Whisper inference.
+
+## Privacy and language limitations
+
+Audio is uploaded to the local HisabBot backend for local FFmpeg/Whisper processing and is not intentionally sent to a cloud speech-recognition service. The temporary upload and converted audio are removed after processing. Access to the microphone occurs only after clicking the microphone button.
+
+Whisper's multilingual base model can return Urdu in Urdu script. Recognition may contain errors, especially with background noise, accents, Roman Urdu, or mixed Urdu/English speech. Roman Urdu output is not guaranteed. Always review and edit the transcript before sending it to chat.
+
+## Troubleshooting
+
+- **Local tools unavailable:** verify the executable, model, FFmpeg, and FFprobe paths; set the variables above in the backend terminal and restart the backend.
+- **Microphone unavailable or denied:** allow microphone access in the browser's site settings, check the selected input device, then reload the Chat page.
+- **Unsupported recording or timeout:** use a current Chrome/Edge build and a shorter, clearer clip. The UI shows an error without sending the transcript.
+
+The transcription endpoint is `POST /api/transcribe` with multipart fields `audio` and `language` (`auto`, `en`, or `ur`). Success returns `{ "success": true, "text": "..." }`; an auto-detected `language` is included only when Whisper reports it reliably.
 
 ---
 
@@ -406,7 +454,6 @@ Users interact with their finances using everyday language.
 
 # Future Improvements
 
-* Voice-based expense recording
 * Budget recommendations
 * Multi-user authentication
 * Mobile application
