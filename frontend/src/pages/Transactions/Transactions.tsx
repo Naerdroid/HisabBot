@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Plus, Search, Filter, Edit2, Trash2, ChevronLeft, ChevronRight, ArrowUpDown } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { transactionApi, type Transaction, type TransactionFilters, type CreateTransaction, type PaginatedTransactions } from '../../services/api';
+import { transactionApi, getApiErrorMessage, type Transaction, type TransactionFilters, type CreateTransaction, type PaginatedTransactions } from '../../services/api';
 import { formatCurrency, formatDate } from '../../utils/helpers';
 import TransactionForm from '../../components/TransactionForm';
 import ConfirmDialog from '../../components/ConfirmDialog';
@@ -40,18 +40,27 @@ export default function Transactions() {
   }, [searchInput]);
 
   const handleCreate = async (data: CreateTransaction) => {
-    await transactionApi.create(data);
-    toast.success('Transaction added');
-    setShowForm(false);
-    fetchData();
+    try {
+      await transactionApi.create(data);
+      toast.success('Transaction added');
+      setShowForm(false);
+      fetchData();
+    } catch (err) {
+      // Keep the form open so the user can correct and retry
+      toast.error(getApiErrorMessage(err, 'Failed to add transaction. Please try again.'));
+    }
   };
 
   const handleUpdate = async (data: CreateTransaction) => {
     if (!editingTx) return;
-    await transactionApi.update(editingTx.id, data);
-    toast.success('Transaction updated');
-    setEditingTx(null);
-    fetchData();
+    try {
+      await transactionApi.update(editingTx.id, data);
+      toast.success('Transaction updated');
+      setEditingTx(null);
+      fetchData();
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, 'Failed to update transaction. Please try again.'));
+    }
   };
 
   const handleDelete = async () => {
@@ -62,8 +71,8 @@ export default function Transactions() {
       toast.success('Transaction deleted');
       setDeleteId(null);
       fetchData();
-    } catch {
-      toast.error('Failed to delete transaction');
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, 'Failed to delete transaction. Please try again.'));
     } finally {
       setDeleting(false);
     }

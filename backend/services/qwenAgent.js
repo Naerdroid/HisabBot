@@ -27,6 +27,7 @@ const {
   updateTransaction,
   deleteTransaction,
   getSummaryRange,
+  findItemAlias,
 } = require('./transactionService');
 
 // LM Studio local server (OpenAI-compatible endpoint)
@@ -36,6 +37,19 @@ const REQUEST_TIMEOUT_MS = 120000; // local models can be slow on first token
 
 // Hard cap on tool-call rounds per user message (prevents infinite loops)
 const MAX_TOOL_ITERATIONS = 5;
+
+// Conversation history sent by the frontend with each message (so follow-ups
+// like "5000 ka" can be resolved against a pending transaction). Capped in
+// count and length so history can never blow up the request or the prompt.
+const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_CONTENT_LENGTH = 2000;
+
+// The recap is embedded in the user's message rather than sent as separate
+// conversation turns: small local models attend far better to the latest user
+// message, and a preceding "assistant" turn can trigger them to imitate an old
+// confirmation instead of calling the tool for the new request.
+const RECAP_TURNS = 4;
+const RECAP_CONTENT_LIMIT = 600;
 
 // ─── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -82,7 +96,7 @@ STRICT RULES:
 
 4. DATE AND PERIOD HANDLING
    - The current date is provided in the user's message as [Current date: YYYY-MM-DD].
-   - For "today", ALWAYS use get_summary_range with from = today's date and to = today's date when the user is asking for today's income, expense, profit, or financial totals.
+   - For "today", use get_summary (it returns today_income, today_expense and today_net_profit) or get_summary_range with from = today's date and to = today's date. Both return today's exact figures.
    - For "today's transactions", get_transactions may be used with from = today's date and to = today's date.
    - For "yesterday", use get_summary_range with the previous date as both from and to.
    - For "this week", use get_summary_range with the appropriate week start and today's date.
@@ -130,8 +144,9 @@ STRICT RULES:
 
 9. SUMMARIES
 
-   * Use get_summary for overall/all-time financial summary and today's transactions when appropriate.
+   * Use get_summary for overall/all-time totals AND today's figures — it returns today_income, today_expense and today_net_profit alongside the all-time totals.
    * Use get_summary_range for a specific date range or period.
+   * For an item-specific summary, pass the requested item in get_summary_range's item filter and pass type as "Expense" for spending or "Income" for earnings. Item filters match known English, Urdu and Roman Urdu aliases without changing stored item names.
    * If the user asks "What is my total income?", use the appropriate summary tool and report the exact returned total.
    * If the user asks "How much did I earn today?", make sure the answer uses today's data, not the all-time total.
    * If the tool returns multiple totals for different periods, clearly label which total you are reporting.
@@ -154,7 +169,7 @@ STRICT RULES:
 * Use tools whenever actual database information is required.
 * If a tool returns an error, honestly tell the user that the requested operation could not be completed.
 
-12. MISSING INFORMATION
+12. MISSING INFORMATION AND PENDING TRANSACTIONS
 
 * If required information is missing, ask a concise clarification question.
 * Do not guess important financial information.
@@ -162,6 +177,24 @@ STRICT RULES:
   User: "I sold some kapra."
   Correct response: ask for the amount.
 * Do not call create_transaction until all required information is available.
+
+PENDING TRANSACTIONS (MULTI-MESSAGE FLOW):
+
+* The user's new message arrives with a "[Recent conversation for context]" recap above it. Use that context.
+* If the recap shows an incomplete transaction and the user's new message supplies the missing information, COMBINE them into ONE transaction.
+* Ask ONLY for information that is still missing. Never re-ask for details the user already gave.
+* Keep the transaction type already established: if the user earlier said they bought, paid or spent something (Expense), a follow-up message that only gives an amount is still that Expense. It is NEVER Income.
+* A reply such as "5000 ka", "5000" or "five thousand" after you asked for the amount means PKR 5000 for that pending transaction.
+* Only call create_transaction once the combined information is complete.
+* Every user message is a NEW request. Even if the recap shows a transaction that was already recorded, a newly reported transaction still requires a NEW create_transaction call in THIS turn.
+* Never imitate or repeat a confirmation message from the recap. Only confirm a recording when THIS turn's create_transaction result confirms success.
+* Example:
+  User: "maine kapra khareeda"
+  You: ask for the amount.
+  User: "5000 ka"
+  Correct: call create_transaction with type "Expense", amount 5000, item "kapra", payment_mode "Cash".
+  Wrong: asking again whether it is Income or Expense.
+  Wrong: recording it as Income.
 
 13. LANGUAGE RULE:
 Always match the user's language.
@@ -176,6 +209,7 @@ Examples:
 
 Do NOT randomly switch languages.
 Do NOT use Arabic for an English or Roman Urdu user.
+Reply in the same language and script the user writes in. If they write Roman Urdu, reply in Roman Urdu. Never switch to Devanagari unless the user does.
 
 14. FINANCIAL FORMATTING
 
@@ -202,12 +236,13 @@ Do NOT use Arabic for an English or Roman Urdu user.
 
 17. TODAY'S HISAB IS DIFFERENT FROM OVERALL HISAB
    - When the user asks "aaj ka hisab", "today's hisab", "aaj ki income", "aaj ka expense", or similar, the primary answer MUST describe TODAY only.
-   - The all-time totals returned by get_summary MUST NOT be presented as today's income, today's expense, or today's profit.
-   - get_summary contains both:
+   - get_summary returns TWO separate sets of figures:
        * ALL-TIME totals: total_income, total_expense, net_profit
-       * TODAY'S transactions: today's transactions list
-   - If today's transaction list is empty, explicitly say that there are no transactions today.
-   - When there are no transactions today, report today's income, expense and profit as PKR 0 unless the tool provides separate non-zero daily totals.
+       * TODAY-ONLY totals: today_income, today_expense, today_net_profit (plus the today transactions list)
+   - For any "today" question, report today_income, today_expense and today_net_profit EXACTLY as returned by the tool.
+   - NEVER use the all-time net_profit as today's profit.
+   - Do not calculate today's profit yourself — today_net_profit is already provided by the tool.
+   - If today's totals are 0, say there are no transactions today and report PKR 0 exactly.
    - Only mention all-time totals as additional information and clearly label them as "overall" or "all-time".
 
 Before every financial answer, internally verify:
@@ -229,7 +264,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'create_transaction',
-      description: 'Record a new financial transaction (Income or Expense) in the database. Use when the user reports selling/earning (Income) or spending/paying (Expense) with a complete amount and item.',
+      description: 'Record a new financial transaction (Income or Expense) in the database. Use when the user reports selling/earning (Income) or spending/paying (Expense) with a complete amount and item. If the user described part of the transaction in an earlier message (e.g. the item) and the latest message supplies the rest (e.g. the amount), combine the messages and record ONE transaction.',
       parameters: {
         type: 'object',
         properties: {
@@ -246,7 +281,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'get_summary',
-      description: "Get the overall/all-time financial totals AND a separate list of TODAY\\'S transactions. IMPORTANT: total_income, total_expense and net_profit are ALL-TIME values, NOT today\\'s values. The today transactions list is separate. Use this tool for overall totals or when the user asks for today\\'s transactions.",
+      description: "Get all-time financial totals AND today\\'s figures in one call. ALL-TIME fields: total_income, total_expense, net_profit. TODAY-ONLY fields: today_income, today_expense, today_net_profit, plus the list of today\\'s transactions. For any question about today (today\\'s hisab, income, expense or profit), report the today_* fields exactly. NEVER present the all-time net_profit as today\\'s profit.",
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -316,12 +351,14 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'get_summary_range',
-      description: 'Get financial summary for a date range: total_income, total_expense, net_profit, daily_breakdown and by_item breakdown. Use for period questions like "this month", "last week", "January".',
+      description: 'Get financial summary for a date range: total_income, total_expense, net_profit, daily_breakdown and by_item breakdown. Optional item and type filters support item-specific spending or earnings questions. Use for period questions like "this month", "last week", "January".',
       parameters: {
         type: 'object',
         properties: {
           from: { type: 'string', description: 'Start date, YYYY-MM-DD.' },
           to: { type: 'string', description: 'End date, YYYY-MM-DD.' },
+          item: { type: 'string', description: 'Optional item to filter by; equivalent English, Urdu and Roman Urdu names are matched.' },
+          type: { type: 'string', enum: ['Income', 'Expense'], description: 'Optional transaction type filter.' },
         },
         required: ['from', 'to'],
       },
@@ -514,13 +551,371 @@ function sanitizeListArgs(raw) {
 }
 
 function sanitizeRangeArgs(raw) {
+  const args = {};
   for (const field of ['from', 'to']) {
     if (typeof raw[field] !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw[field])) {
       return { ok: false, error: `${field} must be a YYYY-MM-DD date string` };
     }
+    args[field] = raw[field];
   }
-  return { ok: true, args: { from: raw.from, to: raw.to } };
+  if (raw.item !== undefined) {
+    if (typeof raw.item !== 'string' || !raw.item.trim()) {
+      return { ok: false, error: 'item must be a non-empty string' };
+    }
+    args.item = raw.item.trim();
+  }
+  if (raw.type !== undefined) {
+    if (raw.type !== 'Income' && raw.type !== 'Expense') {
+      return { ok: false, error: "type must be 'Income' or 'Expense'" };
+    }
+    args.type = raw.type;
+  }
+  return { ok: true, args };
 }
+
+// ─── Conversation History Sanitizer ────────────────────────────────────────────
+// History entries come from the client and are never trusted blindly: keep only
+// well-formed user/assistant turns, capped in count and content length.
+
+function sanitizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+
+  const clean = [];
+  for (const entry of history) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.role !== 'user' && entry.role !== 'assistant') continue;
+    if (typeof entry.content !== 'string' || !entry.content.trim()) continue;
+    clean.push({
+      role: entry.role,
+      content: entry.content.slice(0, MAX_HISTORY_CONTENT_LENGTH),
+    });
+  }
+  return clean.slice(-MAX_HISTORY_MESSAGES);
+}
+
+// Format the last few turns as a plain-text recap for the user message.
+// Assistant replies that claim a transaction was recorded are replaced with a
+// short neutral note: the full "Transaction recorded successfully…" template
+// is the strongest trigger for the model to imitate a confirmation instead of
+// calling create_transaction for a new request, but dropping the turn
+// entirely would leave the preceding user message looking unresolved. The
+// note keeps the state clear without offering a template to copy.
+function buildRecap(history) {
+  return history
+    .slice(-RECAP_TURNS)
+    .map((m) => {
+      if (m.role === 'assistant' && claimsRecording(m.content)) {
+        return '(The transaction discussed above was completed and saved.)';
+      }
+      const label = m.role === 'user' ? 'User' : 'Assistant';
+      const content =
+        m.content.length > RECAP_CONTENT_LIMIT
+          ? `${m.content.slice(0, RECAP_CONTENT_LIMIT)}…`
+          : m.content;
+      return `${label}: ${content}`;
+    })
+    .join('\n');
+}
+
+// ─── Response Integrity Check ──────────────────────────────────────────────────
+// Small models sometimes imitate an earlier confirmation ("Transaction recorded
+// successfully…") instead of actually calling create_transaction, producing a
+// false success claim with nothing saved. The agent loop detects that mismatch
+// (claim without a create_transaction call in THIS turn) and gives the model
+// one corrective round to either really record the transaction or re-answer.
+
+const RECORD_CLAIM_PATTERN =
+  /(recorded|saved)\s+(successfully|in the database)|(has\s+been|been)\s+(recorded|saved)|transaction\s+(was\s+)?(recorded|saved)|(record|save)\s*(ho\s*gaya|kar\s*diya)/i;
+
+function claimsRecording(text) {
+  return RECORD_CLAIM_PATTERN.test(text);
+}
+
+const URDU_SCRIPT_PATTERN = /[\u0600-\u06ff]/;
+const ROMAN_URDU_PATTERN =
+  /\b(?:aaj|kal|maine|mein|mera|meri|mujhe|ka|ki|ke|kapra|kapray|kapde|becha|bechi|khareeda|kharida|khareedi|kharcha|kitna|kitni|hai|hain|hua|hue|do|batao)\b/i;
+const AMOUNT_WORDS = new Set([
+  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+  'seventeen', 'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty',
+  'sixty', 'seventy', 'eighty', 'ninety', 'hundred', 'thousand', 'million',
+  'ek', 'do', 'teen', 'char', 'chaar', 'paanch', 'panch', 'che', 'chhe',
+  'saat', 'sat', 'aath', 'ath', 'nau', 'das', 'gyarah', 'barah', 'terah',
+  'chaudah', 'pandrah', 'bees', 'tees', 'chalis', 'chaalis', 'pachaas', 'sau',
+  'hazaar', 'lakh', 'ایک', 'دو', 'تین', 'چار', 'پانچ', 'چھ', 'سات', 'آٹھ',
+  'نو', 'دس', 'گیارہ', 'بارہ', 'تیرہ', 'چودہ', 'پندرہ', 'بیس', 'تیس', 'چالیس',
+  'پچاس', 'سو', 'ہزار', 'لاکھ',
+]);
+const INCOME_INTENT_PATTERNS = [
+  /\b(?:sell|sells|selling|sold|sale|earn|earns|earned|earning|receive|receives|received|income|revenue)\b/i,
+  /(?:بیچ|فروخت|کما|کمائی|وصول|آمدنی)/,
+  /\b(?:bech(?:a|i|e|ay)?|farokht|kam(?:a|ai|aya|aye|ayi)|wasool|mila|mili|miley)\b/i,
+];
+const EXPENSE_INTENT_PATTERNS = [
+  /\b(?:buy|buys|buying|bought|purchase|purchased|spend|spends|spending|spent|pay|pays|paying|paid|expense|expenses)\b/i,
+  /(?:خرید|خرچ(?:ہ|ے)?|اخراجات|ادا)/,
+  /\b(?:khareed(?:a|i|e|ay)?|kharid(?:a|i|e|ay)?|kharch(?:a|ay)?|ada|diya|diye)\b/i,
+];
+
+function detectResponseLanguage(text, history = []) {
+  if (URDU_SCRIPT_PATTERN.test(text)) return 'urdu';
+  if (ROMAN_URDU_PATTERN.test(text)) return 'roman Urdu';
+  if (/\b(?:i|we|my|the|a|an|for|today|yesterday|rupees|sold|sell|bought|buy|earned|spent|paid|income|expense|hello|how|what|please|show|tell)\b/i.test(text)) {
+    return 'English';
+  }
+  for (let index = history.length - 1; index >= 0; index--) {
+    if (history[index].role !== 'user') continue;
+    if (URDU_SCRIPT_PATTERN.test(history[index].content)) return 'urdu';
+    if (ROMAN_URDU_PATTERN.test(history[index].content)) return 'roman Urdu';
+    return 'English';
+  }
+  return 'English';
+}
+
+function detectTransactionIntent(text) {
+  const intentText = text.replace(/\b(?:got|was|were)\s+paid\b/gi, 'received');
+  const isIncome = INCOME_INTENT_PATTERNS.some((pattern) => pattern.test(intentText));
+  const isExpense = EXPENSE_INTENT_PATTERNS.some((pattern) => pattern.test(intentText));
+  const hasNegation = /\b(?:not|never|didn't|did not|don't|do not|nahi|nahin|mat)\b|(?:نہیں|نہ)/i.test(text);
+  if (hasNegation && (isIncome || isExpense)) return 'ambiguous';
+  if (isIncome && isExpense) return 'ambiguous';
+  if (isIncome) return 'Income';
+  if (isExpense) return 'Expense';
+  return undefined;
+}
+
+function isQuestion(text) {
+  return /[?؟]|^\s*(?:what|how|when|where|which|who|did|do|does|can|could|would|should|is|are|was|were)\b|\b(?:how much|what is|what was|did i|do i|can i)\b|^\s*کیا|(?:کتنا|کتنی|کب|کہاں)|\b(?:kya|kitna|kitni|kab|kahan|kaise)\b/i.test(text);
+}
+
+function asksAboutCurrentMonth(text) {
+  return /\bthis month\b|\bis mahine\b|\bis maheene\b|اس\s+مہینے|اس\s+ماہ/i.test(text);
+}
+
+function getPendingTransactionMessage(history) {
+  const lastAssistantIndex = history.findLastIndex((entry) => entry.role === 'assistant');
+  if (lastAssistantIndex < 0) return undefined;
+
+  const lastAssistant = history[lastAssistantIndex].content;
+  const asksForDetails =
+    /[?؟]|\b(?:please provide|how much|what was|which|tell me the|amount)\b|(?:کتنی|کتنا|رقم|بتائیں|بتاؤ)/i.test(lastAssistant);
+  if (claimsRecording(lastAssistant) || !asksForDetails) return undefined;
+
+  for (let index = lastAssistantIndex - 1; index >= 0; index--) {
+    if (history[index].role === 'user') return history[index].content;
+  }
+  return undefined;
+}
+
+const TRANSACTION_FILLER_WORDS = new Set([
+  'a', 'an', 'the', 'i', 'we', 'you', 'my', 'our', 'some', 'today', 'yesterday',
+  'for', 'on', 'of', 'to', 'from', 'in', 'at', 'by', 'with', 'using', 'via',
+  'rupee', 'rupees', 'pkr', 'rs', 'cash', 'card', 'cheque', 'check', 'upi', 'other',
+  'bank', 'transfer', 'paid', 'pay', 'paying', 'got', 'was', 'were', 'received',
+  'sell', 'sells', 'selling', 'sold', 'sale', 'earn', 'earns', 'earned', 'earning',
+  'income', 'revenue', 'buy', 'buys', 'buying', 'bought', 'purchase', 'purchased',
+  'spend', 'spends', 'spending', 'spent', 'expense', 'expenses',
+  'maine', 'main', 'mein', 'mera', 'meri', 'mujhe', 'ne', 'ka', 'ki', 'ke',
+  'aaj', 'kal', 'hua', 'hue', 'huwa', 'tha', 'thi', 'bech', 'becha', 'bechi', 'beche', 'bechay', 'farokht',
+  'kiya', 'liya', 'liye', 'li',
+  'kamaya', 'kamai', 'kamaye', 'kamayi', 'wasool', 'mila', 'mili', 'miley',
+  'khareed', 'khareeda', 'khareedi', 'khareede', 'khareeday',
+  'kharid', 'kharida', 'kharidi', 'kharide', 'khariday',
+  'kharch', 'kharcha', 'ada', 'diya', 'diye',
+  ...AMOUNT_WORDS,
+  'میں', 'نے', 'کا', 'کی', 'کے', 'آج', 'کل', 'بیچ', 'بیچا', 'بیچی', 'بیچے', 'فروخت',
+  'کیا', 'دیا', 'دی', 'لی', 'لیا', 'لیے', 'ہوا', 'ہوئی', 'ہوئے',
+  'کمایا', 'کمائی', 'کمائے', 'وصول', 'آمدنی', 'خرید', 'خریدا', 'خریدی', 'خریدے', 'خرچ',
+  'اخراجات', 'ادا', 'روپے', 'نقد',
+]);
+
+function extractTransactionItem(text) {
+  const item = (text.match(/[\p{L}]+/gu) || [])
+    .filter((word) => !TRANSACTION_FILLER_WORDS.has(word.toLocaleLowerCase()))
+    .join(' ')
+    .trim();
+  return item && item.length <= 200 ? item : undefined;
+}
+
+function extractPaymentMode(text) {
+  if (/\b(?:bank transfer|transfer)\b/i.test(text)) return 'Bank Transfer';
+  if (/\bcard\b/i.test(text)) return 'Card';
+  if (/\b(?:cheque|check)\b/i.test(text)) return 'Cheque';
+  if (/\bupi\b/i.test(text)) return 'UPI';
+  if (/\bother\b/i.test(text)) return 'Other';
+  return 'Cash';
+}
+
+function extractTransactionDetails(text, type) {
+  const amounts = [...text.matchAll(/\d[\d,]*/g)]
+    .map((match) => Number(match[0].replace(/,/g, '')))
+    .filter((amount) => Number.isSafeInteger(amount) && amount > 0);
+  if (amounts.length !== 1) return undefined;
+
+  const item = extractTransactionItem(text);
+  if (!item) return undefined;
+  return { type, amount: amounts[0], item, payment_mode: extractPaymentMode(text) };
+}
+
+function extractModelAmount(rawArgs, sourceText, transactionIntent) {
+  let parsed = {};
+  if (typeof rawArgs === 'string') {
+    try {
+      parsed = JSON.parse(rawArgs);
+    } catch {
+      return undefined;
+    }
+  } else if (rawArgs && typeof rawArgs === 'object') {
+    parsed = rawArgs;
+  }
+  const amount = Number(parsed.amount);
+  if (!Number.isSafeInteger(amount) || amount <= 0) return undefined;
+
+  const numericAmounts = [...sourceText.matchAll(/\d[\d,]*/g)]
+    .map((match) => Number(match[0].replace(/,/g, '')))
+    .filter((value) => Number.isSafeInteger(value) && value > 0);
+  if (numericAmounts.length > 1 || (numericAmounts.length === 1 && numericAmounts[0] !== amount)) {
+    return undefined;
+  }
+  if (numericAmounts.length === 0 &&
+      ![...AMOUNT_WORDS].some((word) => new RegExp(`(?:^|\\s)${word}(?:$|\\s)`, 'i').test(sourceText))) {
+    return undefined;
+  }
+
+  const item = extractTransactionItem(sourceText);
+  if (!item) return undefined;
+  return {
+    type: transactionIntent,
+    amount,
+    item,
+    payment_mode: extractPaymentMode(sourceText),
+  };
+}
+
+function clarificationResponse(language) {
+  if (language === 'urdu') {
+    return 'براہِ کرم واضح کریں: یہ رقم آپ کو ملی تھی یا آپ نے خرچ کی؟ وضاحت کے بغیر لین دین درج نہیں کیا جائے گا۔';
+  }
+  if (language === 'roman Urdu') {
+    return 'Meherbani karke wazeh karein: yeh raqam aapko mili thi ya aap ne kharch ki? Wazahat ke baghair transaction record nahi hoga.';
+  }
+  return 'Was this money received or spent? Please clarify before I record the transaction.';
+}
+
+function missingTransactionDetailResponse(text, language) {
+  const hasAmount = /\d[\d,]*/.test(text);
+  if (!hasAmount) {
+    if (language === 'urdu') return 'براہِ کرم رقم بتائیں۔';
+    if (language === 'roman Urdu') return 'Barah-e-karam raqam bata dein.';
+    return 'What was the amount?';
+  }
+  if (language === 'urdu') return 'براہِ کرم بتائیں کہ کون سی چیز بیچی یا خریدی گئی تھی۔';
+  if (language === 'roman Urdu') return 'Barah-e-karam batayein ke kaunsi cheez bechi ya khareedi gayi thi.';
+  return 'What item was sold or bought?';
+}
+
+function formatTransactionResponse(result, language) {
+  if (!result?.success || !result.data?.transaction) {
+    if (language === 'urdu') return 'معذرت، لین دین محفوظ نہیں ہو سکا۔ براہِ کرم تفصیلات دوبارہ چیک کریں۔';
+    if (language === 'roman Urdu') return 'Maazrat, transaction save nahi ho saka. Barah-e-karam details dobara check karein.';
+    return "I couldn't save the transaction. Please check the details and try again.";
+  }
+
+  const { id, type, amount, item, payment_mode: paymentMode } = result.data.transaction;
+  const formattedAmount = Number(amount).toLocaleString('en-US');
+  const details = `${item}, PKR ${formattedAmount} (${paymentMode})`;
+  const idText = id === undefined ? '' : ` Transaction #${id}.`;
+
+  if (language === 'urdu') {
+    const label = type === 'Income' ? 'آمدنی درج کر دی گئی' : 'خرچ درج کر دیا گیا';
+    return `${label}: ${details}۔${id === undefined ? '' : ` ٹرانزیکشن نمبر ${id}۔`}`;
+  }
+  if (language === 'roman Urdu') {
+    const label = type === 'Income' ? 'Aamdani darj kar di gayi' : 'Kharcha darj kar diya gaya';
+    return `${label}: ${details}.${idText}`;
+  }
+  return `${type} recorded: ${details}.${idText}`;
+}
+
+function formatSummaryResponse(result, language) {
+  const data = result?.data;
+  if (!result?.success || !data) return undefined;
+
+  const formatAmount = (amount) => Number(amount || 0).toLocaleString('en-US');
+  if (language === 'urdu') {
+    return `مجموعی آمدنی: PKR ${formatAmount(data.total_income)}، مجموعی اخراجات: PKR ${formatAmount(data.total_expense)}، خالص منافع: PKR ${formatAmount(data.net_profit)}۔ آج کی آمدنی: PKR ${formatAmount(data.today_income)}، اخراجات: PKR ${formatAmount(data.today_expense)}، خالص منافع: PKR ${formatAmount(data.today_net_profit)}۔`;
+  }
+  if (language === 'roman Urdu') {
+    return `Majmoi aamdani PKR ${formatAmount(data.total_income)}, majmoi kharch PKR ${formatAmount(data.total_expense)}, aur net munafa PKR ${formatAmount(data.net_profit)} hai. Aaj ki aamdani PKR ${formatAmount(data.today_income)}, kharch PKR ${formatAmount(data.today_expense)}, aur net munafa PKR ${formatAmount(data.today_net_profit)} hai.`;
+  }
+  return `Overall income: PKR ${formatAmount(data.total_income)}, expenses: PKR ${formatAmount(data.total_expense)}, net profit: PKR ${formatAmount(data.net_profit)}. Today, income: PKR ${formatAmount(data.today_income)}, expenses: PKR ${formatAmount(data.today_expense)}, net profit: PKR ${formatAmount(data.today_net_profit)}.`;
+}
+
+function formatItemSummaryResponse(result, language) {
+  const data = result?.data;
+  if (!result?.success || !data || !Array.isArray(data.transactions)) return undefined;
+
+  const type = data.filters.type;
+  const total = data.transactions.reduce((sum, transaction) => sum + transaction.amount, 0);
+  const amountText = `PKR ${Number(total).toLocaleString('en-US')}`;
+  const details = data.transactions.map((transaction) =>
+    `${transaction.created_at.slice(0, 10)}: PKR ${Number(transaction.amount).toLocaleString('en-US')}`
+  );
+  const detailText = details.length ? `\n${details.join('\n')}` : '';
+
+  if (language === 'urdu') {
+    const statement = type === 'Income'
+      ? `اس مہینے کپڑوں سے کل آمدنی: ${amountText}۔`
+      : `اس مہینے کپڑوں پر کل خرچ: ${amountText}۔`;
+    return `${statement}${detailText ? `\n${details.map((detail) => detail.replace(':', '۔')).join('\n')}` : ''}`;
+  }
+  if (language === 'roman Urdu') {
+    const statement = type === 'Income'
+      ? `Is mahine kapron se kul aamdani ${amountText} hui hai.`
+      : `Is mahine kapron par kul kharch ${amountText} hua hai.`;
+    return `${statement}${detailText}`;
+  }
+  const label = type === 'Income' ? 'earned' : 'spent';
+  return `Total ${label} from clothing this month: ${amountText}.${detailText}`;
+}
+
+function enforceResponseLanguage(response, language) {
+  const hasUrduScript = URDU_SCRIPT_PATTERN.test(response);
+  if (language === 'urdu' && !hasUrduScript) {
+    return 'معذرت، میں اس سوال کا درست جواب تیار نہیں کر سکا۔ براہِ کرم اسے دوبارہ واضح انداز میں پوچھیں۔';
+  }
+  if (language === 'roman Urdu') {
+    const romanMarkers = (response.match(/\b(?:aap|aapki|aapka|main|mein|hai|hain|ka|ki|ke|ko|nahi|nahin|aaj|kal|aur|bata|batayein|karein|chahiye|karna|hoon)\b/gi) || []).length;
+    const englishMarkers = (response.match(/\b(?:the|your|you|are|is|income|expense|expenses|today|overall|please|could|would|help|profit|transactions|recorded)\b/gi) || []).length;
+    if (hasUrduScript || (romanMarkers === 0 && englishMarkers > 0) || englishMarkers > romanMarkers * 2) {
+      return 'Maazrat, main is sawal ka durust jawab tayyar nahi kar saka. Barah-e-karam dobara wazeh taur par poochhein.';
+    }
+  }
+  if (language === 'English' && hasUrduScript) {
+    return "Sorry, I couldn't prepare a reliable answer. Please rephrase your question.";
+  }
+  return response;
+}
+
+function simpleGreetingResponse(message) {
+  const greeting = message.trim().replace(/[.!?]+$/, '').toLowerCase();
+  if (['hello', 'hi', 'hey'].includes(greeting)) return 'Hello! How can I help you today?';
+  if (['good morning', 'good afternoon', 'good evening'].includes(greeting)) {
+    return `${greeting[0].toUpperCase()}${greeting.slice(1)}! How can I help you today?`;
+  }
+  if (['السلام علیکم', 'السلام عليكم'].includes(greeting)) {
+    return 'وعلیکم السلام! میں آپ کی کس طرح مدد کر سکتا ہوں؟';
+  }
+  if (['assalam o alaikum', 'assalamu alaikum', 'salam'].includes(greeting)) {
+    return 'Wa alaikum assalam! Main aapki kis tarah madad kar sakta hoon?';
+  }
+  return undefined;
+}
+
+const INTEGRITY_CHECK_MESSAGE =
+  "[System integrity check] You did not call create_transaction in this conversation turn, so NOTHING was saved in this turn. Your previous reply claiming a successful recording was incorrect. " +
+  "If the user's latest message reports a transaction that has not been saved yet, call create_transaction now with its complete details. " +
+  "If you are unsure whether it was saved earlier, use get_transactions to check — do NOT create a duplicate.";
 
 // ─── Tool Execution ────────────────────────────────────────────────────────────
 // Every path goes through transactionService — the single SQLite access layer.
@@ -577,7 +972,7 @@ function executeTool(db, name, rawArgs) {
     case 'get_summary_range': {
       const check = sanitizeRangeArgs(parsed);
       if (!check.ok) return { success: false, error: check.error };
-      const { status, body } = getSummaryRange(db, check.args.from, check.args.to);
+      const { status, body } = getSummaryRange(db, check.args.from, check.args.to, check.args);
       return { success: status < 400, data: body };
     }
     default:
@@ -593,9 +988,15 @@ function executeTool(db, name, rawArgs) {
  *
  * @param {object} db      - better-sqlite3 instance (used only by approved tools)
  * @param {string} message - the user's message text
+ * @param {Array}  history - optional prior turns: [{ role: 'user'|'assistant', content }]
  * @returns {{ response: string, tools_used: string[] }}
  */
-async function processChatMessage(db, message) {
+async function processChatMessage(db, message, history = []) {
+
+  const sanitizedHistory = sanitizeHistory(history);
+  const responseLanguage = detectResponseLanguage(message, sanitizedHistory);
+  const greeting = simpleGreetingResponse(message);
+  if (greeting) return { response: greeting, tools_used: [] };
 
   const today = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Karachi',
@@ -604,20 +1005,138 @@ async function processChatMessage(db, message) {
   day: '2-digit',
 }).format(new Date());
 
+  const messageIsQuestion = isQuestion(message);
+  const detectedIntent = detectTransactionIntent(message);
+  const itemAlias = findItemAlias(message);
+  if (
+    messageIsQuestion &&
+    itemAlias &&
+    (detectedIntent === 'Income' || detectedIntent === 'Expense') &&
+    asksAboutCurrentMonth(message)
+  ) {
+    const [year, month] = today.split('-');
+    const result = executeTool(db, 'get_summary_range', {
+      from: `${year}-${month}-01`,
+      to: today,
+      item: itemAlias,
+      type: detectedIntent,
+    });
+    const response = formatItemSummaryResponse(result, responseLanguage);
+    return {
+      response: enforceResponseLanguage(
+        response || (responseLanguage === 'urdu'
+          ? 'معذرت، اس مہینے کے لین دین کی تفصیل حاصل نہیں ہو سکی۔'
+          : responseLanguage === 'roman Urdu'
+            ? 'Maazrat, is mahine ke transactions ki tafseel hasil nahi ho saki.'
+            : "Sorry, I couldn't retrieve this month's transactions."),
+        responseLanguage
+      ),
+      tools_used: ['get_summary_range'],
+    };
+  }
+  if (detectedIntent === 'ambiguous' && !messageIsQuestion) {
+    return { response: clarificationResponse(responseLanguage), tools_used: [] };
+  }
+  const currentIntent = messageIsQuestion ? undefined : detectedIntent;
+  const pendingMessage = currentIntent ? undefined : getPendingTransactionMessage(sanitizedHistory);
+  const pendingIntent = pendingMessage ? detectTransactionIntent(pendingMessage) : undefined;
+  const transactionIntent = currentIntent || pendingIntent;
+  const transactionSource = currentIntent
+    ? message
+    : pendingIntent
+      ? `${pendingMessage} ${message}`
+      : undefined;
+  const transactionDetails = transactionSource && transactionIntent
+    ? extractTransactionDetails(transactionSource, transactionIntent)
+    : undefined;
+  if (transactionIntent && !transactionDetails) {
+    return {
+      response: missingTransactionDetailResponse(transactionSource || message, responseLanguage),
+      tools_used: [],
+    };
+  }
+  if (transactionDetails) {
+    const result = executeTool(db, 'create_transaction', transactionDetails);
+    return {
+      response: formatTransactionResponse(result, responseLanguage),
+      tools_used: ['create_transaction'],
+    };
+  }
+  const languageInstruction =
+    `[Response language requirement: Reply in ${responseLanguage}. ` +
+    (responseLanguage === 'urdu'
+      ? 'Use readable Urdu in Urdu script, not Roman Urdu or English.'
+      : responseLanguage === 'roman Urdu'
+        ? 'Use natural Roman Urdu in Latin letters, not Urdu script.'
+        : 'Use natural English, not Urdu or Roman Urdu.') +
+    ']\n\n';
+  const systemLanguageRule =
+    responseLanguage === 'urdu'
+      ? 'For this reply, use only clear, natural Urdu written in Urdu script. Do not answer in English or Roman Urdu.'
+      : responseLanguage === 'roman Urdu'
+        ? 'For this reply, use clear, natural Roman Urdu written with Latin letters. Do not answer in Urdu script or English.'
+        : 'For this reply, use natural English. Do not answer in Urdu or Roman Urdu.';
+
+  // buildRecap drops assistant confirmations, so it can be empty even when
+  // history exists — in that case the new message stands on its own.
+  const recap = sanitizedHistory.length > 0 ? buildRecap(sanitizedHistory) : '';
+
+  let userContent;
+  if (recap) {
+    userContent =
+      languageInstruction +
+      `[Current date: ${today}]\n\n` +
+      `[Recent conversation for context — the user's new message below continues this conversation]\n` +
+      `${recap}\n\n` +
+      `[The user's new message]\n${message}`;
+  } else {
+    userContent = `${languageInstruction}[Current date: ${today}]\n\n${message}`;
+  }
+
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: `[Current date: ${today}]\n\n${message}` },
+    { role: 'system', content: `${SYSTEM_PROMPT}\n\n${systemLanguageRule}` },
+    { role: 'user', content: userContent },
   ];
 
   const toolsUsed = [];
+  let summaryResult;
+  let integrityChecked = false; // the corrective round runs at most once
 
   for (let round = 0; round < MAX_TOOL_ITERATIONS; round++) {
     const assistantMsg = await callQwen(messages, TOOLS);
 
-    // Plain answer (no tool calls) → we are done
+    // Plain answer (no tool calls) → we are done, unless the answer claims a
+    // recording that never happened this turn (claimsRecording detects the
+    // mismatch). One corrective round lets the model actually call
+    // create_transaction — see the Response Integrity Check section above.
     if (!assistantMsg.tool_calls) {
+      const modelResponse =
+        assistantMsg.content.trim() || 'Maazrat, main jawab generate nahi kar saka. Please dobara try karein.';
+
+      if (summaryResult) {
+        return {
+          response: enforceResponseLanguage(
+            formatSummaryResponse(summaryResult, responseLanguage) || modelResponse,
+            responseLanguage
+          ),
+          tools_used: toolsUsed,
+        };
+      }
+
+      if (
+        !integrityChecked &&
+        round < MAX_TOOL_ITERATIONS - 2 &&
+        !toolsUsed.includes('create_transaction') &&
+        claimsRecording(modelResponse)
+      ) {
+        integrityChecked = true;
+        messages.push(assistantMsg);
+        messages.push({ role: 'user', content: INTEGRITY_CHECK_MESSAGE });
+        continue;
+      }
+
       return {
-        response: assistantMsg.content.trim() || 'Maazrat, main jawab generate nahi kar saka. Please dobara try karein.',
+        response: enforceResponseLanguage(modelResponse, responseLanguage),
         tools_used: toolsUsed,
       };
     }
@@ -638,6 +1157,10 @@ async function processChatMessage(db, message) {
         continue;
       }
 
+      if (name === 'create_transaction' && !transactionIntent) {
+        return { response: clarificationResponse(responseLanguage), tools_used: [] };
+      }
+
       toolsUsed.push(name);
 
       let result;
@@ -648,6 +1171,8 @@ async function processChatMessage(db, message) {
         console.error(`Tool ${name} execution error:`, err.message);
         result = { success: false, error: 'Tool execution failed due to a database error.' };
       }
+
+      if (name === 'get_summary') summaryResult = result;
 
       messages.push({
         role: 'tool',
@@ -660,7 +1185,10 @@ async function processChatMessage(db, message) {
 
   // Safety valve — max iterations reached without a final answer
   return {
-    response: 'Maazrat, is message ko process karne mein der lag gayi. Please apni request ko simplify kar ke dobara bhejein.',
+    response: enforceResponseLanguage(
+      'Maazrat, is message ko process karne mein der lag gayi. Please apni request ko simplify kar ke dobara bhejein.',
+      responseLanguage
+    ),
     tools_used: toolsUsed,
   };
 }
